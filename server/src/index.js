@@ -18,6 +18,13 @@ import {
   registerResult,
   evaluateGate,
 } from './inspection.js';
+import {
+  defaultSceneState,
+  saveScene as saveSceneState,
+  deleteScene as deleteSceneState,
+  activateScene as activateSceneState,
+  activeSceneOf,
+} from './scene.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.resolve(__dirname, '../../client/dist');
@@ -138,7 +145,7 @@ function cleanScreenName(raw, fallback) {
 }
 
 function publicScreen(rec) {
-  return { id: rec.id, name: rec.name, online: rec.online, cue: rec.cue };
+  return { id: rec.id, name: rec.name, online: rec.online, cue: rec.cue, sceneVersion: rec.sceneVersion ?? 0 };
 }
 
 function broadcastScreens() {
@@ -182,9 +189,14 @@ function registerScreen(client, rawId, rawName) {
   client.screenId = id;
   screens.set(id, rec);
 
+  // 新连接尚未确认任何场景版本：待其应用首包中的当前场景完整快照后回执 scene_applied
+  rec.sceneVersion = 0;
+
   send(client.ws, { type: 'screen_hello', screen: publicScreen(rec) });
   // 断线重连：补发该屏“未确认”的最新提示（已确认的不再出现）
   if (rec.cue && rec.cue.status !== 'acknowledged') deliverCue(rec);
+  // 当前场景启用标记摘要时，重连注册即补发摘要，投屏恢复完整当前场景
+  if (activeSceneOf(sceneState).modules.markers) send(client.ws, sceneMarkersPayload());
   broadcastScreens();
 }
 
@@ -220,6 +232,22 @@ function reportCue(client, msg, nextStatus) {
     rec.cue.status = 'acknowledged';
     broadcastScreens();
   }
+}
+
+// 投屏上报“已完整应用某场景版本”（收到完整快照一次性替换后回执）。
+// 仅接受本连接所注册屏幕的上报；重复/更旧版本的迟到回执只取最大值，
+// 不会把该屏的确认状态回退（旧场景迟到消息不能覆盖新场景的确认结果）。
+function reportSceneApplied(client, msg) {
+  const ver = Number(msg.version);
+  if (!client.screenId || client.screenId !== String(msg.screenId ?? '')) {
+    fail(client, 'NOT_YOUR_SCREEN', '不能替其他屏幕上报场景确认');
+    return;
+  }
+  const rec = screens.get(client.screenId);
+  if (!rec || !Number.isInteger(ver) || ver < 0) return; // 未知屏幕/非法版本：静默丢弃
+  if (ver <= (rec.sceneVersion ?? 0)) return;            // 重复或迟到旧版本：不回退
+  rec.sceneVersion = ver;
+  broadcastScreens();
 }
 
 // 控制台发送提示：目标为屏幕 ID 数组（一块/多块，可含离线屏排队补发）或 '*'（全部在线屏）
@@ -294,6 +322,66 @@ function remainingNow() {
 // 巡检消息与现场标记一样按角色过滤：已注册为投屏的连接不接收巡检更新。
 // ---------------------------------------------------------------------------
 const inspection = defaultInspection();
+
+// ---------------------------------------------------------------------------
+// 投屏场景编排（scene）
+// 持有者最多保存 8 个场景：每个场景选择投屏模块（倒计时 / 议程 / 提示 / 标记摘要）
+// 与布局参数（主题 / 字号 / 垂直位置）。保存、删除、切换都令 sceneState.version
+// 严格递增，服务端据此生成“完整场景快照”（全部场景 + 当前激活场景完整定义），
+// 在同一个同步广播循环内整体替换下发（原子广播）：
+//   - 投屏只接受同 epoch 且 version 更高的场景快照，旧场景迟到消息天然不能覆盖新场景；
+//   - 投屏应用完整快照后回单 scene_applied，控制台按屏展示“已确认 / 待确认”；
+//   - 断线重连首包即携带当前场景完整快照，投屏恢复当前场景。
+// 场景只决定投屏“如何展示”，不触碰计时 / 议程 / 提示 / 标记状态：
+// 切换期间未确认提示在服务端原样保留（投屏端在提示模块关闭时暂挂、重新开启后复显）。
+// 默认视图（activeId=null）= 倒计时/议程/提示开启、标记摘要关闭，与上线前行为一致。
+// ---------------------------------------------------------------------------
+const sceneState = defaultSceneState();
+
+// 标记摘要随场景下发给投屏的最近条数（仅当前激活场景启用标记摘要模块时）
+const SCENE_MARKER_RECENT = 3;
+
+function scenesPayload() {
+  return {
+    type: 'scenes',
+    epoch,
+    version: sceneState.version,
+    activeId: sceneState.activeId,
+    active: activeSceneOf(sceneState), // 当前激活场景完整定义（默认视图回退）
+    scenes: sceneState.scenes.map((s) => ({ ...s })),
+  };
+}
+
+function broadcastScenes() {
+  const msg = scenesPayload();
+  for (const c of clients) send(c.ws, msg);
+}
+
+// 投屏端“标记摘要”数据（整体替换）：仅注册为投屏的连接、
+// 且当前激活场景启用 markers 模块时才下发；控制台仍走完整 markers 通道。
+function sceneMarkersPayload() {
+  return {
+    type: 'scene_markers',
+    epoch,
+    sessionId: session.id,
+    count: markers.length,
+    latest: markers.slice(-SCENE_MARKER_RECENT).map((m) => ({
+      seq: m.seq,
+      name: m.name,
+      wallTime: m.wallTime,
+      itemName: m.itemName,
+      itemIndex: m.itemIndex,
+    })),
+  };
+}
+
+function broadcastSceneMarkers() {
+  if (!activeSceneOf(sceneState).modules.markers) return;
+  const msg = sceneMarkersPayload();
+  for (const c of clients) {
+    if (c.screenId) send(c.ws, msg);
+  }
+}
 
 // 门禁失效原因的人读文案（同时下发 code，客户端可自行措辞）
 const GATE_REASON_TEXT = {
@@ -785,6 +873,7 @@ function handleCommand(client, msg) {
   const PUBLIC_COMMANDS = new Set([
     'acquire', 'heartbeat', 'release',
     'screen_register', 'screen_rename', 'cue_displayed', 'cue_ack',
+    'scene_applied',
     'handover_redeem',
   ]);
   if (!PUBLIC_COMMANDS.has(cmd)) {
@@ -978,6 +1067,7 @@ function handleCommand(client, msg) {
         return;
       }
       broadcastMarkers();
+      broadcastSceneMarkers(); // 当前场景启用标记摘要时，投屏同步摘要（整体替换）
       return;
     }
 
@@ -989,6 +1079,7 @@ function handleCommand(client, msg) {
         return;
       }
       broadcastMarkers();
+      broadcastSceneMarkers();
       return;
     }
 
@@ -1050,6 +1141,52 @@ function handleCommand(client, msg) {
     case 'cue_send': {
       // 控制台向一块/多块/全部在线投屏发送提示（仅持有者）
       sendCueCommand(client, msg);
+      return;
+    }
+
+    case 'scene_save': {
+      // 投屏场景编排：新建/更新一个场景（最多 8 个）；成功后整体替换广播。
+      // 保存的恰为当前激活场景时，投屏立即按新定义一次性替换。
+      const r = saveSceneState(sceneState, msg.scene);
+      if (r.error) {
+        fail(client, r.error, r.message);
+        return;
+      }
+      Object.assign(sceneState, r.state);
+      broadcastScenes();
+      broadcastSceneMarkers(); // 激活场景刚启用标记摘要时立即补发摘要
+      return;
+    }
+
+    case 'scene_delete': {
+      // 删除场景；删除当前激活场景自动回到默认视图（同样递增版本、整体广播）
+      const r = deleteSceneState(sceneState, msg.id);
+      if (r.error) {
+        fail(client, r.error, r.message);
+        return;
+      }
+      Object.assign(sceneState, r.state);
+      broadcastScenes();
+      return;
+    }
+
+    case 'scene_activate': {
+      // 原子切换当前场景：版本递增 → 生成完整快照 → 同一循环广播给全部连接。
+      // 不触碰计时/议程/提示/标记状态，未确认提示原样保留。
+      const r = activateSceneState(sceneState, msg.id);
+      if (r.error) {
+        fail(client, r.error, r.message);
+        return;
+      }
+      Object.assign(sceneState, r.state);
+      broadcastScenes();
+      broadcastSceneMarkers(); // 新场景启用标记摘要时立即补发；关闭时投屏按快照隐藏
+      return;
+    }
+
+    case 'scene_applied': {
+      // 投屏完整应用场景快照后的确认（公开指令，内部按屏幕身份鉴权）
+      reportSceneApplied(client, msg);
       return;
     }
 
@@ -1120,6 +1257,8 @@ wss.on('connection', (ws) => {
   send(ws, { type: 'hello', clientId: client.id, epoch });
   send(ws, buildSnapshot());
   send(ws, { type: 'screens', epoch, screens: [...screens.values()].map(publicScreen) });
+  // 投屏场景编排完整快照（含当前激活场景完整定义）：重连即恢复当前场景
+  send(ws, scenesPayload());
   // 现场标记随首包一并下发（此刻尚未注册为投屏）；投屏注册后不再收到标记更新
   send(ws, markersPayload());
   // 设备巡检门禁状态同样随首包下发（此刻尚未注册为投屏）

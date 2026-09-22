@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { monoNow } from './time.js';
+import { activeScene } from './scene.js';
 import {
   judgeSnapshot,
   judgeCue,
@@ -32,6 +33,8 @@ export function useSocket({ role, screenRef }) {
   const [control, setControl] = useState({ granted: false });
   const [myId, setMyId] = useState(null);              // 本连接服务端分配的 clientId
   const [handover, setHandover] = useState(null);      // 控制台交接：{ state, ... } 等待/成功/过期/取消
+  const [scenes, setScenes] = useState(null);          // 投屏场景编排完整快照（含当前激活场景）
+  const [sceneMarkers, setSceneMarkers] = useState(null); // 投屏：当前场景的标记摘要（模块开启时才有）
   const [lastError, setLastError] = useState(null);
   const wsRef = useRef(null);
   const retryRef = useRef(0);
@@ -42,7 +45,10 @@ export function useSocket({ role, screenRef }) {
   const baselineRef = useRef({ ...INITIAL_BASELINE });
   const cueBaselineRef = useRef({ ...INITIAL_CUE_BASELINE });
   const handoverBaselineRef = useRef({ ...INITIAL_HANDOVER_BASELINE });
+  const sceneBaselineRef = useRef({ ...INITIAL_BASELINE }); // 场景版本守卫（与快照同规则）
   const reportedCueRef = useRef(0); // 已上报“已显示”的 cueSeq（同一条补发不重复上报）
+  const sceneRefRef = useRef(scenes);
+  sceneRefRef.current = scenes;
   const screenRefRef = useRef(screenRef);
   screenRefRef.current = screenRef;
 
@@ -78,6 +84,18 @@ export function useSocket({ role, screenRef }) {
   const clearHandover = useCallback(() => setHandover(null), []);
 
   const clearError = useCallback(() => setLastError(null), []);
+
+  // 投屏：提示只有在当前场景启用“提示”模块时才真正上屏。
+  // 暂挂中的未确认提示在模块开启（或切换回含提示模块的场景）后复显，并据此补报“已显示”；
+  // 模块关闭期间不上报，控制台保持“未送达”，从机制上保证切换不丢提示、状态不虚报。
+  const cueModuleOn = role === 'display' && activeScene(sceneRefRef.current).modules.cue;
+  useEffect(() => {
+    if (role !== 'display' || !cue || !cueModuleOn) return;
+    if (reportedCueRef.current === cue.cueSeq) return;
+    reportedCueRef.current = cue.cueSeq;
+    const sid = screenRefRef.current;
+    if (sid) send({ command: 'cue_displayed', screenId: sid.id, cueSeq: cue.cueSeq });
+  }, [role, cue, cueModuleOn, send]);
 
   // 投屏修改显示名：持久化后重发注册（服务端立即改名并广播）
   const renameScreen = useCallback((name) => {
@@ -146,7 +164,10 @@ export function useSocket({ role, screenRef }) {
           baselineRef.current = { currentEpoch: msg.epoch, currentVersion: 0 };
           cueBaselineRef.current = { currentEpoch: msg.epoch, cueSeq: 0 };
           handoverBaselineRef.current = { currentEpoch: msg.epoch, seq: 0 };
+          sceneBaselineRef.current = { currentEpoch: msg.epoch, currentVersion: 0 };
           reportedCueRef.current = 0;
+          // 新纪元/新连接：丢弃旧标记摘要，权威摘要由首包（启用时由注册后补发）重建
+          setSceneMarkers(null);
           // 新纪元：丢弃上一纪元残留的门禁横幅（权威状态随 inspection 首包重建）
           setGateEvent(null);
           return;
@@ -174,6 +195,41 @@ export function useSocket({ role, screenRef }) {
         if (msg.type === 'screens') {
           // 屏幕名单（含每屏最新提示与状态）由服务端权威整体替换
           setScreens(Array.isArray(msg.screens) ? msg.screens : []);
+          return;
+        }
+
+        if (msg.type === 'scenes') {
+          // 场景编排完整快照守卫：同 epoch 且 version 严格更高才接受；
+          // 旧场景的迟到消息（低版本/旧纪元）一律丢弃，不能覆盖新场景。
+          // 接受后整体替换（含当前激活场景完整定义），React 单次提交一次性换屏。
+          const verdict = judgeSnapshot(sceneBaselineRef.current, msg);
+          if (!verdict.accept) return;
+          sceneBaselineRef.current = { currentEpoch: verdict.epoch, currentVersion: verdict.version };
+          setScenes({
+            version: msg.version,
+            activeId: msg.activeId ?? null,
+            active: msg.active ?? null,
+            scenes: Array.isArray(msg.scenes) ? msg.scenes : [],
+          });
+          // 投屏完整应用快照后回执确认（控制台据此展示各屏确认状态）。
+          // 注册在 open 时已先行发出（同一连接消息有序），服务端处理本回执时屏幕身份已建立。
+          if (role === 'display') {
+            const sid = screenRefRef.current;
+            if (sid) send({ command: 'scene_applied', screenId: sid.id, version: msg.version });
+          }
+          return;
+        }
+
+        if (msg.type === 'scene_markers' && role === 'display') {
+          // 投屏标记摘要（整体替换）：仅当前场景启用该模块时服务端才会下发；
+          // 是否渲染仍由当前场景配置把关，旧纪元残留消息丢弃。
+          if (baselineRef.current.currentEpoch !== null && msg.epoch !== baselineRef.current.currentEpoch) {
+            return;
+          }
+          setSceneMarkers({
+            count: Number(msg.count) || 0,
+            latest: Array.isArray(msg.latest) ? msg.latest : [],
+          });
           return;
         }
 
@@ -263,15 +319,11 @@ export function useSocket({ role, screenRef }) {
           const verdict = judgeCue(cueBaselineRef.current, msg);
           if (!verdict.accept) return;
           cueBaselineRef.current = { currentEpoch: verdict.epoch, cueSeq: verdict.cueSeq };
-          const sid = screenRefRef.current;
           const nextCue = { cueSeq: msg.cueSeq, cueType: msg.cueType, text: msg.text };
+          // 无论当前场景是否启用提示模块都先暂挂：切换期间未确认提示不得丢失。
+          // 模块关闭时仅暂存不上屏、不上报“已显示”；模块重新开启时由 effect 复显并补报。
           setCue(nextCue);
           setScreenConflict(false);
-          // 新提示（或重启纪元后的首条）通知服务端“已上屏”；同一条补发不重复上报
-          if (verdict.fresh || reportedCueRef.current !== msg.cueSeq) {
-            reportedCueRef.current = msg.cueSeq;
-            send({ command: 'cue_displayed', screenId: sid?.id, cueSeq: msg.cueSeq });
-          }
           return;
         }
 
@@ -358,6 +410,8 @@ export function useSocket({ role, screenRef }) {
     inspection,
     gateEvent,
     cue,
+    scenes,
+    sceneMarkers,
     screenConflict,
     connState,
     control,
