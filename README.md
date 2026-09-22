@@ -5,11 +5,13 @@
 当前环节**提前结束或超时**后自动推演后续偏差，多块大屏打开**投屏页**实时联播倒计时、
 当前/下一环节及其预计开始时间；进入 60 秒与归零时切换醒目状态。控制台还可向**一块、多块
 或全部在线投屏**全屏推送“请上场／加快／结束”或不超过 30 字的自定义提示，按屏幕实时查看
-未送达 / 已显示 / 已确认。控制台还提供**现场标记**：持有控制权时在当前环节记录带名称的
-事件（发言切换、设备故障等），服务端以单调时钟固化发生时刻、归属环节与相对计划偏差，
-按时间线展示、可删除最近一条并按本场会话导出 CSV（投屏不显示任何标记）。唯一控制权支持
-**控制台交接**：持有者生成 60 秒有效的一次性交接码，接收方输入后由服务端原子接管，
-计时 / 议程 / 巡检 / 提示状态连续保持、投屏不中断。
+未送达 / 已显示 / 已确认。持有者可保存最多 **8 个投屏场景**（倒计时 / 议程 / 提示 /
+标记摘要模块及布局参数），按场景版本生成**完整快照并原子广播切换**，投屏一次性替换、
+断线重连恢复当前场景，控制台逐屏显示确认状态。控制台还提供**现场标记**：持有控制权时在当前
+环节记录带名称的事件（发言切换、设备故障等），服务端以单调时钟固化发生时刻、归属环节与
+相对计划偏差，按时间线展示、可删除最近一条并按本场会话导出 CSV（投屏仅在场景启用
+“标记摘要”模块时显示摘要）。唯一控制权支持**控制台交接**：持有者生成 60 秒有效的一次性
+交接码，接收方输入后由服务端原子接管，计时 / 议程 / 巡检 / 场景 / 提示状态连续保持、投屏不中断。
 
 - **后端**：Node.js 原生 HTTP + [`ws`](https://github.com/websockets/ws) WebSocket
 - **前端**：React 18 + Vite（控制台 `/console`、投屏 `/display`）
@@ -87,6 +89,32 @@ docker run --rm -p 3000:3000 --name venue-countdown venue-countdown
 > 提示状态保存在服务端内存中（不引入数据库或第三方服务）：服务进程重启后未确认提示会清空，
 > 但投屏的屏幕 ID 与显示名在浏览器本地保留，重开后自动重新注册。
 
+### 投屏场景编排（scene）
+
+把多块大屏在不同环节需要呈现的内容提前编排为**场景**，一键原子切换：
+
+1. 在控制台 **投屏场景编排** 面板维护最多 **8 个场景**：每个场景可勾选
+   **倒计时 / 议程 / 提示 / 标记摘要**四个模块，设置每个模块的尺寸（小 / 中 / 大）与
+   整体布局（**纵向排布** 或 **网格排布**）；点 **保存场景库** 同步编排（不立即换画面）。
+2. 点场景卡片上的 **切换并广播**：服务端按新的**场景激活版本（activeVersion 单调递增）**
+   生成**完整快照**（场景编排 + 内嵌权威计时/议程快照 + 标记摘要），在同一原子步骤内
+   广播给全部在线投屏；投屏收到后**一次性替换**整个画面并自动回传确认。
+3. 面板顶部与每块屏幕旁实时显示确认状态：**◌ 切换中 / ✓ 已确认 / ○ 离线**
+   （已确认数/在线数）；所有在线屏确认后显示全部完成。
+4. **断线重连恢复当前场景**：投屏（含刷新页面）重新注册后立即收到当前激活场景的完整快照
+   （`replayed`），恢复同一画面、同一剩余时间，并重新回传确认；离线期间错过的切换在重连后
+   自动对齐到最新场景，不会停留在旧画面。
+5. **切换期间未确认提示不丢失**：场景广播的同一原子步骤内为每屏补发其未确认的最新提示；
+   场景未启用“提示”模块时提示仍以原有全屏覆盖方式展示，启用后内联到模块中并可现场确认。
+6. **旧场景迟到消息不得覆盖新场景**：`scene_switch` / `scene_markers` 与计时快照同一套
+   epoch + 单调版本守卫，更旧 `activeVersion` 的迟到消息（含旧确认上报）一律丢弃；
+   只有当前激活版本的确认才计入确认状态。
+7. “标记摘要”模块展示本场会话最近 6 条现场标记（`T+` 会话内时间 / 名称 / 归属环节）；
+   仅当前场景启用该模块时，标记增删才向投屏推送整体替换的 `scene_markers`（带版本守卫）；
+   未启用时投屏不显示任何标记。场景库消息只发给控制台类连接，投屏不感知完整场景库。
+8. 场景编排仅存服务端内存，服务 / 容器重启即回到默认“标准投屏”场景
+   （倒计时 + 议程纵向排布）；编辑保存与切换均仅持有者可执行，非持有者收到 `NOT_CONTROLLER`。
+
 ### 现场标记（marker）
 
 1. 在控制台 **现场标记** 面板输入名称（不超过 **30 字**，如“发言切换”“设备故障”）后回车，
@@ -98,7 +126,8 @@ docker run --rm -p 3000:3000 --name venue-countdown venue-countdown
 3. 面板按 **seq 升序时间线** 展示本场全部标记；可 **删除最近一条**
    （仅删 seq 最大者，可连续撤销），或点 **导出 CSV** 下载本场会话全部标记
    （UTF-8 BOM，Excel 直接打开中文不乱码，列：序号/发生时刻/会话内时间/环节序号/环节名称/环节已用秒数/相对计划偏差秒数/计时状态/标记名称）。
-4. **投屏不显示标记**：标记消息只推送给控制台类连接，投屏注册后不接收任何标记更新。
+4. **投屏默认不显示标记**：标记库消息只推送给控制台类连接；仅当当前投屏场景启用
+   “标记摘要”模块时，投屏才通过场景快照 / `scene_markers` 显示最近若干条摘要（无操作入口）。
 5. 暂停计时、断线重连、进入下一环节或整体改写议程，**历史标记的顺序与归属均保持不变**
    （旧标记仍挂在记录时的环节名下）。标记仅持有者可新增 / 删除；导出无需控制权。
 6. “本场会话”= 一个服务进程生命周期：服务 / 容器重启即清空并开始新会话（带新的 `sessionId`）；
@@ -191,6 +220,19 @@ npm install && npm run build && npm start
     非目标屏收不到、也不能代为确认；
   - 离线（或断线重连中）的目标屏，其未确认最新提示在重新注册后**自动补发**；
     状态只存服务端内存，无任何第三方服务。
+- **投屏场景编排**：
+  - 持有者保存最多 **8 个场景**，每场景选择倒计时 / 议程 / 提示 / 标记摘要四个模块、
+    模块尺寸（小/中/大）与布局（纵向 / 网格）；场景库独立版本化（`seq`），
+    保存只改编排、切换才发布；
+  - 切换按**严格递增 `activeVersion`** 生成**完整快照**（场景 + 内嵌权威计时/议程快照 +
+    标记摘要），在同一原子步骤广播给全部在线投屏，投屏**一次性替换**并自动回传
+    `scene_displayed`，控制台按屏显示 ◌切换中 / ✓已确认 / ○离线；
+  - 投屏（含刷新/断线）重新注册即收到当前场景完整快照（`replayed`），恢复同一画面与
+    同一剩余时间并重新确认；离线屏重连直接对齐最新场景；
+  - 切换的同一原子步骤内补发各屏未确认最新提示（**切换不丢提示**）；
+    场景版本与计时快照共用 epoch + 单调版本守卫，**旧场景迟到消息/旧确认不覆盖新场景**；
+  - 标记摘要仅在场景启用时随快照与 `scene_markers`（整体替换、带版本守卫）下发投屏；
+    场景库消息仅控制台可见；编排仅存服务端内存，重启回到默认“标准投屏”场景。
 - **现场标记**：
   - 持有者在任意计时状态记录 ≤30 字的命名事件（预设一键记录或自定义）；
   - 服务端在记录瞬间以单调时钟固化发生时刻（挂钟时间 + 会话内 `T+`）、归属环节（id/名称/序号快照）、
@@ -267,6 +309,16 @@ npm install && npm run build && npm start
    幂等补发仅用于把交接码补送到生成者。租约以任何方式结束（释放 / 断线 / 超时）都在同一处
    作废旧码，旧持有者之后的心跳与命令天然落到既有的非持有者分支，无法夺回控制权。
    交接事件与交接码均按角色隔离：投屏连接收不到任何交接消息。
+10. **投屏场景为版本化完整快照的原子替换**：场景库（≤8，`scenes.js` 纯函数校验/规范化）
+    与“当前激活”解耦——保存只递增库 `seq`，`scene_activate` 才递增全服务单调 `activeVersion`
+    并生成 `scene_switch`：场景编排 + 内嵌一帧权威 `buildSnapshot()`（同版本计时/议程）+
+    标记摘要。广播、未确认提示补发、各屏确认名单、控制台库对账全部在同一个消息处理内顺序完成
+    （Node 单线程无 await，天然原子）。投屏侧 `judgeScene` 复用 epoch + 单调版本守卫：
+    更大版本一次性替换（内嵌快照同时替换计时基线，杜绝两通道先后造成的闪烁/回滚）、
+    相等版本为重连 replay（幂等）、更旧版本（旧场景/旧纪元）一律丢弃，旧版本的
+    `scene_displayed` 在服务端也静默忽略，控制台只按当前激活版本统计确认；投屏重新注册时
+    服务端清空其确认态并单播当前场景，保证“重连恢复当前场景”。`scene_markers` 走同一版本守卫，
+    仅对启用标记摘要的当前场景生效；场景库消息按角色过滤，投屏注册后不可见。
 
 ## WebSocket 协议（`/ws`）
 
@@ -319,6 +371,19 @@ npm install && npm run build && npm start
 // cueType: stage（请上场）| hurry（加快）| finish（结束）| custom（text 必填，trim 后 1~30 字）
 { "command": "cue_displayed", "screenId": "s-...", "cueSeq": 7 } // 目标投屏上屏后自动上报
 { "command": "cue_ack", "screenId": "s-...", "cueSeq": 7 }       // 目标投屏人工确认
+
+// 投屏场景编排（scene_set / scene_activate 仅持有者；scene_displayed 为投屏公开指令）
+{ "command": "scene_set", "scenes": [   // 整体替换场景库（1~8 个）；内容无变化不递增 seq
+    { "id": "sc-1", "name": "标准投屏", "layout": "stack",      // layout: stack | grid
+      "modules": {                                           // 至少启用一个模块
+        "countdown": { "enabled": true, "size": "lg" },       // size: sm | md | lg
+        "agenda": { "enabled": true, "size": "md" },
+        "cue": { "enabled": false, "size": "md" },
+        "markers": { "enabled": false, "size": "sm" } } } ] }
+{ "command": "scene_activate", "id": "sc-1" } // 切换：activeVersion+1，原子广播完整快照
+{ "command": "scene_displayed", "screenId": "s-...", "activeVersion": 3 } // 投屏一次性替换后上报
+// 错误码：BAD_SCENE（场景库非法/0 或 >8 个/名称超长/全部模块禁用）、NOT_FOUND（场景已删除）；
+//         scene_displayed 鉴权错误：NOT_YOUR_SCREEN / NOT_SCREEN；旧版本上报静默忽略
 ```
 
 服务端 → 客户端：
@@ -330,6 +395,7 @@ npm install && npm run build && npm start
   "durationMs": 300000, "remainingMs": 123456,
   "warning": false, "finished": false,
   "locked": true, "holderId": "c-xxxx",
+  "scene": { "activeVersion": 3 }, // 当前场景激活版本（0=启动后尚未切换）
   "agenda": {
     "seq": 3, "currentId": "a-1", "elapsedMs": 45000, "deviationMs": -15000,
     "items": [ { "id": "a-1", "name": "开场致辞", "startMs": 33300000,
@@ -359,11 +425,35 @@ npm install && npm run build && npm start
 
 // 后台提示相关
 { "type": "screen_hello", "screen": { "id": "s-...", "name": "主席台主屏", "online": true,
-    "cue": { "seq": 7, "type": "stage", "text": "请上场", "status": "displayed" } } }
+    "cue": { "seq": 7, "type": "stage", "text": "请上场", "status": "displayed" },
+    "sceneVersion": 3 } }   // 该屏已确认（已替换上屏）的场景版本；null=尚未确认/未连接
 { "type": "screens", "epoch": "...", "screens": [ /* 全部屏幕，整体替换；
-    cue.status: pending（未送达）| displayed（已显示）| acknowledged（已确认）*/ ] }
+    cue.status: pending（未送达）| displayed（已显示）| acknowledged（已确认）；
+    sceneVersion 与当前 activeVersion 不一致即“切换中/离线” */ ] }
 { "type": "cue", "epoch": "...", "cueSeq": 7, "cueType": "stage", "text": "请上场" } // 仅单播给目标屏
 { "type": "screen_conflict", "screenId": "s-...", "reason": "replaced" } // 同 ID 被新连接顶替
+
+// 投屏场景编排
+// 场景库（仅控制台类连接；连接首包一份，scene_set 内容变化后整体替换广播；投屏注册后不收）
+{ "type": "scenes", "epoch": "...", "seq": 5, "activeId": "sc-1",
+  "activeVersion": 3,        // 当前激活版本：切换广播后递增；scene.displayed 据此对账
+  "activeSeq": 5,            // 激活时库版本：与 seq 不一致表示“有未发布修改”
+  "scenes": [ { "id": "sc-1", "name": "标准投屏", "layout": "stack",
+    "modules": { "countdown": { "enabled": true, "size": "lg" },
+      "agenda": { "enabled": true, "size": "md" },
+      "cue": { "enabled": false, "size": "md" },
+      "markers": { "enabled": false, "size": "sm" } } } ] }
+// 场景切换“完整快照”（仅投屏连接；激活时原子广播，注册/重连时单播 replay=true）
+{ "type": "scene_switch", "epoch": "...", "activeVersion": 3, "sceneSeq": 5,
+  "replayed": false,
+  "scene": { "id": "sc-1", "name": "标准投屏", "layout": "stack", "modules": { /* 同上 */ } },
+  "snapshot": { /* 同版本权威计时/议程完整快照，投屏一次性整体替换 */ },
+  "markers": [ /* 标记摘要：本场会话全部标记的普通数据快照 */ ],
+  "serverTimeMono": 0 }
+// 启用标记摘要模块期间标记增删：整体替换（带 epoch + activeVersion 守卫，仅投屏连接）
+{ "type": "scene_markers", "epoch": "...", "activeVersion": 3, "markerSeq": 12,
+  "sessionId": "m-...", "markers": [ /* 同 markers 消息口径 */ ] }
+// 守卫：旧纪元 / 更小 activeVersion 的 scene_switch、scene_markers、scene_displayed 一律丢弃/忽略
 
 // 现场标记（整体替换；连接首包下发一次，之后仅新增/删除时下发；已注册投屏的连接不收）
 { "type": "markers", "epoch": "...", "sessionId": "m-...", "markers": [
@@ -403,29 +493,33 @@ npm install && npm run build && npm start
 ├── package.json             # npm workspaces 根清单
 ├── server/
 │   └── src/
-│       ├── index.js         # HTTP 静态服务 + WebSocket 状态机/租约 + 屏幕与后台提示 + 现场标记 + 巡检门禁 + 控制台交接
+│       ├── index.js         # HTTP 静态服务 + WebSocket 状态机/租约 + 屏幕与后台提示 + 现场标记 + 巡检门禁 + 控制台交接 + 投屏场景编排
 │       ├── agenda.js        # 议程偏差推演纯函数（顺延 / 固定点压缩 / 校验）
+│       ├── scenes.js        # 投屏场景库纯函数（模块/布局/尺寸校验、规范化、内容签名）
 │       └── inspection.js    # 巡检门禁纯函数（清单校验 / 逐项登记 / 版本化放行判定）
 └── client/
     ├── vite.config.js       # 开发代理 /ws -> localhost:3000
     └── src/
-        ├── useSocket.js     # 自动重连、版本防回滚（快照+提示+交接）、心跳续租、屏幕注册、标记/巡检列表
+        ├── useSocket.js     # 自动重连、版本防回滚（快照+提示+场景+交接）、心跳续租、屏幕注册、标记/巡检列表
         ├── time.js          # 单调时钟插值、议程时钟格式化、挂钟时间/CSV 工具
-        ├── guard.js         # 快照版本守卫 + 提示 cueSeq 守卫 + 交接 seq 守卫
+        ├── guard.js         # 快照版本守卫 + 提示 cueSeq 守卫 + 场景 activeVersion 守卫 + 交接 seq 守卫
         ├── screen.js        # 投屏持久屏幕 ID / 显示名（localStorage）
-        └── pages/           # ConsolePage / DisplayPage / HomePage / AgendaPanel / CuePanel / MarkerPanel / InspectionPanel / HandoverPanel
+        ├── sceneMeta.js     # 场景模块/布局/尺寸等客户端共享常量
+        └── pages/           # ConsolePage / DisplayPage / HomePage / AgendaPanel / CuePanel / ScenePanel / MarkerPanel / InspectionPanel / HandoverPanel
 ```
 
 ## 测试
 
 ```bash
 npm test
-# guard.test.mjs       快照版本守卫 + 提示 cueSeq 守卫纯函数
+# guard.test.mjs       快照版本守卫 + 提示 cueSeq 守卫 + 场景 activeVersion 守卫 + 交接 seq 守卫纯函数
 # agenda.test.mjs      议程偏差推演纯函数（提前/超时/固定点压缩）
+# scenes.test.mjs      投屏场景库纯函数（模块/布局/尺寸校验、规范化、内容签名）
 # cue.test.mjs         后台提示端到端（注册/三态/覆盖/旧确认丢弃/补发/群发/校验，自带独立实例）
 # marker.test.mjs      现场标记端到端（权限/校验/归属固化/暂停冻结/重连/advance/超时偏差/投屏不收，自带独立实例）
 # inspection.test.mjs  设备巡检门禁端到端（权限/校验/放行拦截/故障立即失效广播/编辑版本重置/继续不拦截/投屏不收，自带独立实例）
 # handover.test.mjs    控制台交接端到端（权限/一次性码/错误码/原子转移/状态连续投屏不中断/旧持有者迟到命令/过期/取消/断线/重新生成，自带独立实例）
+# scene.test.mjs       投屏场景编排端到端（库校验/原子广播/一次性替换/各屏确认/重连恢复当前场景/切换不丢提示/旧场景消息守卫/标记摘要开关/角色过滤，自带独立实例）
 # e2e.mjs              WebSocket 端到端冒烟（需先启动服务端，默认端口 3000，可用 PORT 覆盖）
 # lease.test.mjs       失联自动释放与接管（自带独立测试实例）
 ```

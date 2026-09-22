@@ -4,9 +4,11 @@ import {
   judgeSnapshot,
   judgeCue,
   judgeHandover,
+  judgeScene,
   INITIAL_BASELINE,
   INITIAL_CUE_BASELINE,
   INITIAL_HANDOVER_BASELINE,
+  INITIAL_SCENE_BASELINE,
 } from '../client/src/guard.js';
 
 let n = 0;
@@ -129,6 +131,46 @@ check('handover：重新生成（pending→更大 seq pending）作为新事件�
   const v = judgeHandover({ currentEpoch: 'E1', seq: 3 }, { epoch: 'E1', seq: 4, state: 'pending' });
   assert.equal(v.accept, true);
   assert.equal(v.fresh, true);
+});
+
+// ---------------- 投屏场景（scene_switch / scene_markers）守卫 ----------------
+let sceneBase = { currentEpoch: 'E1', activeVersion: 3 };
+
+check('scene：更大 activeVersion 为新场景，接受并标记 fresh（一次性替换）', () => {
+  const v = judgeScene(sceneBase, { epoch: 'E1', activeVersion: 4 });
+  assert.equal(v.accept, true);
+  assert.equal(v.fresh, true);
+  sceneBase = { currentEpoch: v.epoch, activeVersion: v.activeVersion };
+});
+
+check('scene：相等 activeVersion（断线重连 replay / scene_markers 更新）接受但非 fresh', () => {
+  const v = judgeScene(sceneBase, { epoch: 'E1', activeVersion: 4 });
+  assert.equal(v.accept, true);
+  assert.equal(v.fresh, false);
+  assert.equal(v.replay, true);
+});
+
+check('scene：更小 activeVersion 的旧场景迟到消息丢弃（不得覆盖新场景）', () => {
+  const v = judgeScene(sceneBase, { epoch: 'E1', activeVersion: 2 });
+  assert.equal(v.accept, false);
+});
+
+check('scene：旧纪元残留场景消息丢弃（服务重启前）', () => {
+  const v = judgeScene(sceneBase, { epoch: 'E0', activeVersion: 99 });
+  assert.equal(v.accept, false);
+});
+
+check('scene：新纪元在 hello 重置基线后首条接受（重连恢复当前场景）', () => {
+  const v = judgeScene({ currentEpoch: 'E2', activeVersion: 0 }, { epoch: 'E2', activeVersion: 1 });
+  assert.equal(v.accept, true);
+  assert.equal(v.fresh, true);
+});
+
+check('scene：INITIAL_SCENE_BASELINE 下首条兜底接受（hello 丢失场景）', () => {
+  const v = judgeScene(INITIAL_SCENE_BASELINE, { epoch: 'E9', activeVersion: 7 });
+  assert.equal(v.accept, true);
+  assert.equal(v.fresh, true);
+  assert.equal(v.activeVersion, 7);
 });
 
 console.log(`\n守卫单测：${n} 通过，0 失败`);

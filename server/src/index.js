@@ -18,6 +18,13 @@ import {
   registerResult,
   evaluateGate,
 } from './inspection.js';
+import {
+  MODULE_KEYS,
+  defaultScenes,
+  normalizeSceneLibrary,
+  sceneLibrarySignature,
+  findScene,
+} from './scenes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.resolve(__dirname, '../../client/dist');
@@ -138,7 +145,15 @@ function cleanScreenName(raw, fallback) {
 }
 
 function publicScreen(rec) {
-  return { id: rec.id, name: rec.name, online: rec.online, cue: rec.cue };
+  return {
+    id: rec.id,
+    name: rec.name,
+    online: rec.online,
+    cue: rec.cue,
+    // 该屏已确认（已替换上屏）的场景激活版本；控制台据此显示各屏切换确认状态。
+    // null = 尚未确认任何场景（未连接 / 未上报）；小于当前 activeVersion 即“切换中”。
+    sceneVersion: rec.sceneVersion ?? null,
+  };
 }
 
 function broadcastScreens() {
@@ -172,17 +187,24 @@ function registerScreen(client, rawId, rawName) {
     send(old.ws, { type: 'screen_conflict', reason: 'replaced', screenId: id });
   }
   const fallback = defaultScreenName(id);
-  const rec = old ?? { id, name: fallback, online: false, ws: null, client: null, cue: null };
+  const rec = old ?? {
+    id, name: fallback, online: false, ws: null, client: null, cue: null, sceneVersion: null,
+  };
   // 注册携带显示名（投屏本地持久化）；缺省时沿用服务端已有名称
   if (String(rawName ?? '').trim()) rec.name = cleanScreenName(rawName, fallback);
   else if (!old) rec.name = fallback;
   rec.online = true;
   rec.ws = client.ws;
   rec.client = client;
+  // 新连接重新确认当前场景：旧连接上的 sceneVersion 不可代表本连接（可能已断线错过切换）。
+  // 场景完整快照随注册流程单播，投屏替换并上报后，控制台确认状态恢复。
+  rec.sceneVersion = null;
   client.screenId = id;
   screens.set(id, rec);
 
   send(client.ws, { type: 'screen_hello', screen: publicScreen(rec) });
+  // 断线重连恢复“当前场景”：立即下发当前激活场景的完整快照（投屏一次性替换）
+  sendSceneSwitch(client.ws, { replayed: true });
   // 断线重连：补发该屏“未确认”的最新提示（已确认的不再出现）
   if (rec.cue && rec.cue.status !== 'acknowledged') deliverCue(rec);
   broadcastScreens();
@@ -275,6 +297,182 @@ function sendCueCommand(client, msg) {
     deliverCue(rec);
   }
   broadcastScreens();
+}
+
+// ---------------------------------------------------------------------------
+// 投屏场景编排（scene）
+// 持有者保存最多 8 个场景，每场景选择倒计时/议程/提示/标记摘要模块及布局参数。
+// 场景库（scenes 数组 + 库版本 sceneSeq）只下发给控制台类连接用于编辑；
+// 投屏只接收“当前激活场景”的完整快照（scene_switch），不感知整个场景库。
+// 每次切换 activeVersion 单调递增：服务端按场景版本生成完整快照并在同一原子步骤内
+// 广播给所有投屏（内嵌权威计时/议程快照 + 标记摘要），投屏收到后一次性替换并回传确认；
+// 旧场景（更旧 activeVersion）的迟到消息由客户端按 epoch + 版本守卫丢弃，绝不覆盖新场景。
+// 切换期间未确认提示不丢失：广播场景后在同一原子步骤内为每屏补发其未确认最新提示。
+// 数据仅存服务端内存（与议程/标记/提示同级），服务进程重启即回到默认场景。
+// ---------------------------------------------------------------------------
+const sceneLibrary = {
+  scenes: defaultScenes(),
+  seq: 1,                  // 场景库内容版本：编辑保存且内容确实变化时递增
+  activeId: null,          // 当前激活场景 id（启动后初始化为默认首场景）
+  activeSeq: 0,            // 激活时该场景在库中的内容版本：用于提示“已激活场景有未发布修改”
+};
+  sceneLibrary.activeId = sceneLibrary.scenes[0].id;
+
+let activeVersion = 0;     // 切换激活版本：每次 scene_activate 严格递增，投屏据此确认与防回滚
+
+function activeScene() {
+  return findScene(sceneLibrary.scenes, sceneLibrary.activeId) ?? sceneLibrary.scenes[0] ?? null;
+}
+
+function scenesLibraryPayload() {
+  return {
+    type: 'scenes',
+    epoch,
+    seq: sceneLibrary.seq,
+    activeId: sceneLibrary.activeId,
+    activeVersion,
+    activeSeq: sceneLibrary.activeSeq,
+    scenes: sceneLibrary.scenes,
+  };
+}
+
+// 场景库只下发给控制台类连接（未注册为投屏）：投屏不感知完整场景库
+function broadcastSceneLibrary() {
+  const msg = scenesLibraryPayload();
+  for (const c of clients) {
+    if (!c.screenId) send(c.ws, msg);
+  }
+}
+
+function markerSummaryForScene() {
+  // 标记摘要模块只展示最近若干条（倒序/条数在客户端处理）；
+  // 服务端一次性给全量普通数据快照（与 markers 消息同口径），投屏仅在本场景启用该模块时渲染。
+  return markers.map(publicMarker);
+}
+
+// 构造当前激活场景的“完整快照”：场景编排 + 内嵌权威计时/议程快照 + 标记摘要。
+// 投屏据此一次性替换整个画面；内嵌 snapshot 复用同一版本号，切换与计时状态严格一致。
+function buildSceneSwitchPayload({ replayed = false } = {}) {
+  const scene = activeScene();
+  const snapshot = buildSnapshot();
+  return {
+    type: 'scene_switch',
+    epoch,
+    activeVersion,
+    sceneSeq: sceneLibrary.seq,
+    replayed,
+    scene: scene ? {
+      id: scene.id,
+      name: scene.name,
+      layout: scene.layout,
+      modules: scene.modules,
+    } : null,
+    snapshot,
+    markers: markerSummaryForScene(scene),
+    serverTimeMono: nowMono(),
+  };
+}
+
+// 单播给指定连接（投屏）；用于切换广播与断线重连补发
+function sendSceneSwitch(ws, opts) {
+  send(ws, buildSceneSwitchPayload(opts));
+}
+
+// 原子广播切换：JS 单线程同一消息处理内无 await，以下步骤不可被其他消息插入：
+//   1) activeVersion 递增；2) 向全部在线投屏广播完整快照（同一 snapshot.version）；
+//   3) 为每屏补发未确认最新提示（切换期间提示不丢失）；
+//   4) 广播屏幕名单（各屏 sceneVersion 已因新激活版本整体落后，控制台显示“切换中”）；
+//   5) 向控制台类连接广播场景库（新 activeVersion 供对账）。
+function broadcastSceneSwitch() {
+  const payload = buildSceneSwitchPayload();
+  for (const c of clients) {
+    if (c.screenId) send(c.ws, payload);
+  }
+  // 同一原子步骤内补发未确认提示：场景切换不清空任何提示状态
+  for (const rec of screens.values()) {
+    if (rec.online && rec.cue && rec.cue.status !== 'acknowledged') deliverCue(rec);
+  }
+  broadcastScreens();
+  // 控制台需要 activeVersion/activeSeq 对账（不含投屏专用负载）
+  for (const c of clients) {
+    if (!c.screenId) send(c.ws, scenesLibraryPayload());
+  }
+}
+
+// 投屏上报“已按场景版本完成一次性替换”。仅接受当前连接所注册屏幕、
+// 且版本等于当前激活版本的上报；更旧版本（旧场景迟到）静默丢弃，不改确认状态。
+function reportSceneDisplayed(client, msg) {
+  if (!client.screenId || client.screenId !== String(msg.screenId ?? '')) {
+    fail(client, 'NOT_YOUR_SCREEN', '不能替其他屏幕上报场景状态');
+    return;
+  }
+  const rec = screens.get(client.screenId);
+  if (!rec) {
+    fail(client, 'NOT_SCREEN', '屏幕尚未注册');
+    return;
+  }
+  const v = Number(msg.activeVersion);
+  if (!Number.isInteger(v) || v <= 0) return;
+  // 迟到的旧场景确认（切换已继续向前）：忽略，控制台只看当前激活版本的确认进度
+  if (v !== activeVersion) return;
+  if (rec.sceneVersion !== v) {
+    rec.sceneVersion = v;
+    broadcastScreens();
+  }
+}
+
+// 持有者整体替换场景库：最多 8 个，至少 1 个；校验失败返回 BAD_SCENE，服务端状态不变。
+// 内容无变化的保存不递增库版本；若当前激活场景被删除，自动落到首个场景，
+// 但不主动切换投屏（仍需 scene_activate 才换画面）——activeId 指向新场景，
+// 下次激活或重连时生效。
+function saveSceneLibrary(rawScenes) {
+  const result = normalizeSceneLibrary(rawScenes);
+  if (result.error) return result;
+
+  const signature = sceneLibrarySignature(result.scenes);
+  const current = sceneLibrarySignature(sceneLibrary.scenes);
+  if (signature === current) {
+    return { ok: true, changed: false, seq: sceneLibrary.seq };
+  }
+
+  sceneLibrary.scenes = result.scenes;
+  sceneLibrary.seq += 1;
+  if (!findScene(result.scenes, sceneLibrary.activeId)) {
+    sceneLibrary.activeId = result.scenes[0].id;
+    sceneLibrary.activeSeq = 0; // 激活场景已更换内容，等待重新激活
+  }
+  return { ok: true, changed: true, seq: sceneLibrary.seq };
+}
+
+// 持有者切换激活场景：产生新的激活版本，服务端据此生成完整快照并原子广播。
+// 重复激活同一场景也产生新版本（用于把库内最新修改重新发布到投屏）。
+function activateScene(rawId) {
+  const id = String(rawId ?? '');
+  const scene = findScene(sceneLibrary.scenes, id);
+  if (!scene) return { error: 'NOT_FOUND', message: '场景不存在（可能已被删除）' };
+  sceneLibrary.activeId = scene.id;
+  sceneLibrary.activeSeq = sceneLibrary.seq;
+  activeVersion += 1;
+  return { ok: true, activeVersion, scene };
+}
+
+// 投屏在启用“标记摘要”模块时需要随标记增删实时收到更新：
+// scene_markers 携带当前激活版本，投屏仅在同 epoch、同版本且模块启用时接受，
+// 旧场景/旧纪元的迟到更新一律丢弃（新场景可能已不含标记摘要模块）。
+function broadcastSceneMarkers() {
+  const scene = activeScene();
+  if (!scene || !scene.modules.markers.enabled) return;
+  const msg = {
+    type: 'scene_markers',
+    epoch,
+    activeVersion,
+    markerSeq,
+    sessionId: session.id,
+    markers: markers.map(publicMarker),
+  };
+  for (const c of clients) {
+    if (c.screenId) send(c.ws, msg);
+  }
 }
 
 function remainingNow() {
@@ -379,6 +577,7 @@ function buildSnapshot() {
     finished: timer.phase === 'finished',
     locked: !!holder,
     holderId: holder ? holder.id : null,
+    scene: { activeVersion }, // 当前场景激活版本：投屏随周期快照对账，重连/切换后与 scene_switch 一致
     agenda: {
       seq: agenda.seq,
       currentId: agenda.currentId,
@@ -785,6 +984,7 @@ function handleCommand(client, msg) {
   const PUBLIC_COMMANDS = new Set([
     'acquire', 'heartbeat', 'release',
     'screen_register', 'screen_rename', 'cue_displayed', 'cue_ack',
+    'scene_displayed',
     'handover_redeem',
   ]);
   if (!PUBLIC_COMMANDS.has(cmd)) {
@@ -978,6 +1178,8 @@ function handleCommand(client, msg) {
         return;
       }
       broadcastMarkers();
+      // 当前激活场景启用“标记摘要”模块时，投屏随标记增删实时收到整体替换更新
+      broadcastSceneMarkers();
       return;
     }
 
@@ -989,6 +1191,7 @@ function handleCommand(client, msg) {
         return;
       }
       broadcastMarkers();
+      broadcastSceneMarkers();
       return;
     }
 
@@ -1050,6 +1253,35 @@ function handleCommand(client, msg) {
     case 'cue_send': {
       // 控制台向一块/多块/全部在线投屏发送提示（仅持有者）
       sendCueCommand(client, msg);
+      return;
+    }
+
+    case 'scene_set': {
+      // 整体替换场景库（最多 8 个）：仅持有者；校验失败状态不变。
+      // 只更新编排内容与库版本，不直接换画面——需再 scene_activate 才重新发布。
+      const r = saveSceneLibrary(msg.scenes);
+      if (r.error) {
+        fail(client, r.error, r.message);
+        return;
+      }
+      if (r.changed) broadcastSceneLibrary();
+      return;
+    }
+
+    case 'scene_activate': {
+      // 持有者切换场景：按新场景版本生成完整快照并原子广播给所有投屏
+      const r = activateScene(msg.id);
+      if (r.error) {
+        fail(client, r.error, r.message);
+        return;
+      }
+      broadcastSceneSwitch();
+      return;
+    }
+
+    case 'scene_displayed': {
+      // 投屏完成一次性场景替换后上报确认（公开指令，内部校验屏幕身份与版本）
+      reportSceneDisplayed(client, msg);
       return;
     }
 
@@ -1129,6 +1361,9 @@ wss.on('connection', (ws) => {
   const handoverHello = handoverPayload();
   if (handover && handover.holderId !== client.id) delete handoverHello.code;
   send(ws, handoverHello);
+  // 投屏场景库（编排内容 + 当前激活版本）随首包下发；投屏注册后不再收到场景库更新，
+  // 当前激活场景的完整快照在 screen_register 时单独单播（scene_switch）。
+  send(ws, scenesLibraryPayload());
 });
 
 setInterval(tick, TICK_MS).unref();

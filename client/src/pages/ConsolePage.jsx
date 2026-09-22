@@ -3,6 +3,7 @@ import { useSocket } from '../useSocket.js';
 import { formatTime, formatClock, formatDeviation, liveRemaining, liveAgenda } from '../time.js';
 import AgendaPanel from './AgendaPanel.jsx';
 import CuePanel from './CuePanel.jsx';
+import ScenePanel from './ScenePanel.jsx';
 import MarkerPanel from './MarkerPanel.jsx';
 import InspectionPanel from './InspectionPanel.jsx';
 import HandoverPanel from './HandoverPanel.jsx';
@@ -11,6 +12,7 @@ import HandoverPanel from './HandoverPanel.jsx';
 export default function ConsolePage() {
   const {
     snap, screens, markers, inspection, gateEvent, connState, control, myId, handover, lastError,
+    sceneLib,
     send, acquire, release, clearError,
     createHandover, cancelHandover, redeemHandover, clearHandover,
   } = useSocket({ role: 'console' });
@@ -251,6 +253,15 @@ export default function ConsolePage() {
         canSend={control.granted}
         send={send}
         lastError={lastError}
+      />
+
+      <ScenePanel
+        sceneLib={sceneLib}
+        screens={screens}
+        canEdit={control.granted}
+        send={send}
+        lastError={lastError}
+        onClearError={clearError}
       />
 
       <AgendaPanel

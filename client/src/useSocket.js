@@ -4,9 +4,11 @@ import {
   judgeSnapshot,
   judgeCue,
   judgeHandover,
+  judgeScene,
   INITIAL_BASELINE,
   INITIAL_CUE_BASELINE,
   INITIAL_HANDOVER_BASELINE,
+  INITIAL_SCENE_BASELINE,
 } from './guard.js';
 
 // 单一 WebSocket 连接管理：
@@ -27,6 +29,8 @@ export function useSocket({ role, screenRef }) {
   const [inspection, setInspection] = useState(null);  // 控制台：设备巡检门禁状态（投屏收不到更新）
   const [gateEvent, setGateEvent] = useState(null);    // 门禁放行/失效翻转事件（含原因），供横幅提示
   const [cue, setCue] = useState(null);                // 投屏：当前上屏的提示
+  const [sceneLib, setSceneLib] = useState(null);      // 控制台：场景库（编排 + 激活版本）
+  const [scene, setScene] = useState(null);            // 投屏：当前激活场景的完整快照
   const [screenConflict, setScreenConflict] = useState(false); // 投屏：同一 ID 被新连接顶替
   const [connState, setConnState] = useState('connecting'); // connecting | open | reconnecting
   const [control, setControl] = useState({ granted: false });
@@ -42,6 +46,8 @@ export function useSocket({ role, screenRef }) {
   const baselineRef = useRef({ ...INITIAL_BASELINE });
   const cueBaselineRef = useRef({ ...INITIAL_CUE_BASELINE });
   const handoverBaselineRef = useRef({ ...INITIAL_HANDOVER_BASELINE });
+  const sceneBaselineRef = useRef({ ...INITIAL_SCENE_BASELINE });
+  const reportedSceneRef = useRef(0); // 已上报“已替换”的场景激活版本（重连同版本不重复上报）
   const reportedCueRef = useRef(0); // 已上报“已显示”的 cueSeq（同一条补发不重复上报）
   const screenRefRef = useRef(screenRef);
   screenRefRef.current = screenRef;
@@ -146,7 +152,9 @@ export function useSocket({ role, screenRef }) {
           baselineRef.current = { currentEpoch: msg.epoch, currentVersion: 0 };
           cueBaselineRef.current = { currentEpoch: msg.epoch, cueSeq: 0 };
           handoverBaselineRef.current = { currentEpoch: msg.epoch, seq: 0 };
+          sceneBaselineRef.current = { currentEpoch: msg.epoch, activeVersion: 0 };
           reportedCueRef.current = 0;
+          reportedSceneRef.current = 0;
           // 新纪元：丢弃上一纪元残留的门禁横幅（权威状态随 inspection 首包重建）
           setGateEvent(null);
           return;
@@ -172,8 +180,75 @@ export function useSocket({ role, screenRef }) {
         }
 
         if (msg.type === 'screens') {
-          // 屏幕名单（含每屏最新提示与状态）由服务端权威整体替换
+          // 屏幕名单（含每屏最新提示与状态、场景确认版本）由服务端权威整体替换
           setScreens(Array.isArray(msg.screens) ? msg.screens : []);
+          return;
+        }
+
+        if (msg.type === 'scenes' && role === 'console') {
+          // 场景库（编排内容 + 当前激活版本）由服务端权威整体替换；旧纪元残留丢弃
+          if (baselineRef.current.currentEpoch !== null && msg.epoch !== baselineRef.current.currentEpoch) {
+            return;
+          }
+          setSceneLib({
+            seq: msg.seq,
+            activeId: msg.activeId,
+            activeVersion: msg.activeVersion,
+            activeSeq: msg.activeSeq,
+            scenes: Array.isArray(msg.scenes) ? msg.scenes : [],
+          });
+          return;
+        }
+
+        if (msg.type === 'scene_switch' && role === 'display') {
+          // 投屏场景切换：epoch + activeVersion 守卫。
+          // 更大版本=新场景，一次性替换（内嵌 snapshot 同步替换计时画面）；
+          // 相等版本=断线重连/注册 replay，幂等；更小版本=旧场景迟到，丢弃不回滚。
+          const verdict = judgeScene(sceneBaselineRef.current, msg);
+          if (!verdict.accept) return;
+          const isNewVersion = msg.activeVersion !== sceneBaselineRef.current.activeVersion;
+          sceneBaselineRef.current = { currentEpoch: verdict.epoch, activeVersion: verdict.activeVersion };
+          if (msg.snapshot && msg.snapshot.epoch === msg.epoch) {
+            // 内嵌权威快照与切换严格同版本，先替换计时基线，避免周期快照晚到造成闪烁/回滚
+            const snapVerdict = judgeSnapshot(baselineRef.current, msg.snapshot);
+            if (snapVerdict.accept) {
+              baselineRef.current = { currentEpoch: snapVerdict.epoch, currentVersion: snapVerdict.version };
+              setSnap({ ...msg.snapshot, receivedAtMono: monoNow() });
+              // 控制权归属随内嵌快照一并对账（与常规快照分支同一口径）
+              const mine = msg.snapshot.holderId != null && msg.snapshot.holderId === myIdRef.current;
+              heldRef.current = mine;
+            }
+          }
+          setScene({
+            activeVersion: msg.activeVersion,
+            scene: msg.scene,
+            markers: Array.isArray(msg.markers) ? msg.markers : [],
+            receivedAtMono: monoNow(),
+          });
+          // 新版本首次应用立即上报；重连同版本 replay（服务端已重置该屏确认态）也重新上报。
+          // activeVersion=0 是服务启动后尚未切换过的初始 replay，无版本可确认（不上报）。
+          const sid = screenRefRef.current;
+          if (msg.activeVersion > 0
+            && (verdict.fresh || isNewVersion || reportedSceneRef.current !== msg.activeVersion)
+            && sid) {
+            reportedSceneRef.current = msg.activeVersion;
+            send({ command: 'scene_displayed', screenId: sid.id, activeVersion: msg.activeVersion });
+          }
+          return;
+        }
+
+        if (msg.type === 'scene_markers' && role === 'display') {
+          // 启用“标记摘要”模块的场景随标记增删收到整体替换；
+          // epoch + activeVersion 守卫：旧场景/旧纪元迟到更新丢弃，不覆盖新场景。
+          const verdict = judgeScene(sceneBaselineRef.current, msg);
+          if (!verdict.accept) return;
+          // 同版本更新：只替换当前已应用场景的标记；更大版本理论上由 scene_switch 承载
+          sceneBaselineRef.current = { currentEpoch: verdict.epoch, activeVersion: verdict.activeVersion };
+          setScene((prev) => {
+            if (!prev || prev.activeVersion !== msg.activeVersion) return prev;
+            if (!prev.scene?.modules?.markers?.enabled) return prev; // 当前场景未启用标记模块
+            return { ...prev, markers: Array.isArray(msg.markers) ? msg.markers : [] };
+          });
           return;
         }
 
@@ -358,6 +433,8 @@ export function useSocket({ role, screenRef }) {
     inspection,
     gateEvent,
     cue,
+    sceneLib,
+    scene,
     screenConflict,
     connState,
     control,
